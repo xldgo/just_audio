@@ -198,11 +198,77 @@
     return _speed;
 }
 
+#if TARGET_OS_IOS
+// A pure append must not disturb the current AVPlayerItem or the already
+// queued successors. Rebuilding those items during playback can cause audible
+// discontinuities on iOS (in particular with Bluetooth audio).
+//
+// This is deliberately conservative: callers must prove that the logical
+// sequence was extended at its end and that the AVQueuePlayer queue still
+// matches a contiguous, unshuffled slice of that sequence.
+- (BOOL)tryEnqueueAppendedTailWithoutRebuild {
+    if (!_player || !_player.currentItem || _index < 0 ||
+        _index >= (int)_indexedAudioSources.count) {
+        return NO;
+    }
+
+    NSArray<AVPlayerItem *> *queuedItems = _player.items;
+    if (queuedItems.count == 0 || queuedItems.firstObject != _player.currentItem ||
+        (NSUInteger)_index + queuedItems.count > _indexedAudioSources.count) {
+        return NO;
+    }
+    for (NSUInteger i = 0; i < queuedItems.count; i++) {
+        if (queuedItems[i] != _indexedAudioSources[_index + (int)i].playerItem) {
+            return NO;
+        }
+    }
+
+    // Preflight before touching the native queue. Match the existing lazy
+    // preparation window, including the distinction for non-lazy sources.
+    NSMutableArray<AVPlayerItem *> *newItems = [NSMutableArray array];
+    NSUInteger plannedCount = queuedItems.count;
+    BOOL enqueuedAll = YES;
+    for (NSUInteger i = (NSUInteger)_index + queuedItems.count;
+         i < _indexedAudioSources.count; i++) {
+        IndexedAudioSource *source = _indexedAudioSources[i];
+        if (source.lazyLoading && plannedCount >= TREADMILL_SIZE) {
+            enqueuedAll = NO;
+            break;
+        }
+        AVPlayerItem *item = source.playerItem;
+        if (!item || ![_player canInsertItem:item afterItem:nil]) {
+            return NO;
+        }
+        [newItems addObject:item];
+        plannedCount++;
+    }
+
+    for (AVPlayerItem *item in newItems) {
+        [_player insertItem:item afterItem:nil];
+    }
+    _enqueuedAll = enqueuedAll;
+    [self updateEndAction];
+    return YES;
+}
+#endif
+
 // Untested
 - (void)concatenatingInsertAll:(NSString *)catId index:(int)index sources:(NSArray *)sources shuffleOrder:(NSArray<NSNumber *> *)shuffleOrder {
     // Find all duplicates of the identified ConcatenatingAudioSource.
     NSMutableArray *matches = [[NSMutableArray alloc] init];
     [_audioSource findById:catId matches:matches];
+#if TARGET_OS_IOS
+    NSArray<IndexedAudioSource *> *previousSequence = [_indexedAudioSources copy];
+    BOOL canTryTailAppend = matches.count == 1 && sources.count > 0 &&
+        _player.currentItem != nil && _loopMode == lmLoopOff &&
+        !_shuffleModeEnabled && _processingState == psReady && _playing &&
+        !_justAdvanced && CMTIME_IS_INVALID(_seekPos);
+    if (canTryTailAppend) {
+        ConcatenatingAudioSource *target = (ConcatenatingAudioSource *)matches[0];
+        // index < 0 means append at the end of this concatenating source.
+        canTryTailAppend = index < 0 || index == target.count;
+    }
+#endif
     // Add each new source to each match.
     for (int i = 0; i < matches.count; i++) {
         ConcatenatingAudioSource *catSource = (ConcatenatingAudioSource *)matches[i];
@@ -230,7 +296,26 @@
     } else {
         _index = 0;
     }
+#if TARGET_OS_IOS
+    BOOL appendedWithoutRebuild = NO;
+    if (canTryTailAppend && _indexedAudioSources.count > previousSequence.count) {
+        BOOL originalPrefixUnchanged = YES;
+        for (NSUInteger i = 0; i < previousSequence.count; i++) {
+            if (_indexedAudioSources[i] != previousSequence[i]) {
+                originalPrefixUnchanged = NO;
+                break;
+            }
+        }
+        if (originalPrefixUnchanged) {
+            appendedWithoutRebuild = [self tryEnqueueAppendedTailWithoutRebuild];
+        }
+    }
+    if (!appendedWithoutRebuild) {
+        [self enqueueFrom:_index];
+    }
+#else
     [self enqueueFrom:_index];
+#endif
     // Notify each new IndexedAudioSource that it's been attached to the player.
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         if (!_indexedAudioSources[i].isAttached) {
